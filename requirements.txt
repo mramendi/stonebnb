@@ -10,6 +10,7 @@ accelerate>=0.27.0
 datasets>=2.18.0
 
 # Optional but recommended
+flash-attn>=2.0.0  # CRITICAL for long sequences (>4K tokens) - reduces attention memory O(n²)→O(n)
 wandb>=0.16.0  # For experiment tracking
 sentencepiece>=0.1.99  # For Granite tokenizer
 protobuf>=3.20.0  # For tokenizer

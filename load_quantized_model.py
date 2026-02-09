@@ -67,7 +67,19 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
     # Load config
     print("Loading config...")
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
-    print("✓ Config loaded")
+
+    # Try to enable Flash Attention 2 if available (O(n) memory instead of O(n²))
+    try:
+        import flash_attn
+        config._attn_implementation = "flash_attention_2"
+        print("✓ Config loaded with Flash Attention 2 enabled")
+        print("  (This reduces attention memory from O(n²) to O(n) - critical for long sequences!)")
+    except ImportError:
+        print("✓ Config loaded (Flash Attention 2 not available)")
+        print("  ⚠️  WARNING: Flash Attention 2 not installed!")
+        print("  For long sequences (>4K tokens), you may run out of memory during training.")
+        print("  Install with: pip install flash-attn --no-build-isolation")
+        print("  Or use pre-built wheels from: https://github.com/Dao-AILab/flash-attention/releases")
     print()
 
     # Load quantization metadata

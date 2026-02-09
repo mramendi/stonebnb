@@ -114,7 +114,15 @@ python
 
 ```bash
 pip install torch transformers bitsandbytes peft datasets accelerate
+
+# HIGHLY RECOMMENDED for long sequences (>4K tokens):
+pip install flash-attn --no-build-isolation
+# Or download pre-built wheels from:
+#   - Official: https://github.com/Dao-AILab/flash-attention/releases
+#   - Community (convenient): https://github.com/mjun0812/flash-attention-prebuild-wheels
 ```
+
+**Flash Attention 2** is critical if training with sequences longer than ~4K tokens. It reduces attention memory from O(n²) to O(n), preventing OOM errors on long sequences.
 
 ### Get the Code
 
@@ -448,11 +456,17 @@ The `lm_head.weight` is missing or all zeros.
 ### "CUDA out of memory" during training
 
 **Solutions**:
-1. Check for the model dequantizing on load (see above)
-2. Reduce `--batch-size` (try 1)
-3. Reduce `--max-seq-length` (try 1024)
-4. Reduce `--rank` (try 64)
-5. Enable CPU offloading (advanced)
+1. **Install Flash Attention 2** (most important for long sequences!):
+   ```bash
+   pip install flash-attn --no-build-isolation
+   # Or use pre-built wheels: https://github.com/mjun0812/flash-attention-prebuild-wheels
+   ```
+   Flash Attention 2 reduces attention memory from O(n²) to O(n). Without it, sequences >4K tokens will likely OOM.
+2. Check for the model dequantizing on load (see "No quantized tensors" above)
+3. Reduce `--batch-size` (try 1)
+4. Reduce `--max-seq-length` (try 2048 or 4096)
+5. Reduce `--rank` (try 64)
+6. Enable CPU offloading (advanced)
 
 ### "No gradients flowing" (grad_norm=0)
 
