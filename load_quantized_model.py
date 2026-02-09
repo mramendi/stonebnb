@@ -68,18 +68,23 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
     print("Loading config...")
     config = AutoConfig.from_pretrained(model_path, trust_remote_code=True)
 
-    # Try to enable Flash Attention 2 if available (O(n) memory instead of O(n²))
+    print("✓ Config loaded")
+    print()
+
+    # Check if Flash Attention 2 is available (O(n) memory instead of O(n²))
+    use_flash_attn = False
     try:
         import flash_attn
-        config._attn_implementation = "flash_attention_2"
-        print("✓ Config loaded with Flash Attention 2 enabled")
+        use_flash_attn = True
+        print("Flash Attention 2 detected - will be enabled during model creation")
         print("  (This reduces attention memory from O(n²) to O(n) - critical for long sequences!)")
     except ImportError:
-        print("✓ Config loaded (Flash Attention 2 not available)")
-        print("  ⚠️  WARNING: Flash Attention 2 not installed!")
+        print("⚠️  WARNING: Flash Attention 2 not installed!")
         print("  For long sequences (>4K tokens), you may run out of memory during training.")
         print("  Install with: pip install flash-attn --no-build-isolation")
-        print("  Or use pre-built wheels from: https://github.com/Dao-AILab/flash-attention/releases")
+        print("  Or use pre-built wheels from:")
+        print("    - https://github.com/Dao-AILab/flash-attention/releases")
+        print("    - https://github.com/mjun0812/flash-attention-prebuild-wheels")
     print()
 
     # Load quantization metadata
@@ -100,10 +105,19 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
     print()
 
     # Create model structure (on meta device to avoid memory allocation)
+    # CRITICAL: Pass attn_implementation during model creation, not after!
     print("Creating model structure...")
     with torch.device("meta"):
-        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
-    print("✓ Model structure created")
+        if use_flash_attn:
+            model = AutoModelForCausalLM.from_config(
+                config,
+                trust_remote_code=True,
+                attn_implementation="flash_attention_2"
+            )
+            print("✓ Model structure created with Flash Attention 2")
+        else:
+            model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+            print("✓ Model structure created (eager attention)")
     print()
 
     # Load state_dict
