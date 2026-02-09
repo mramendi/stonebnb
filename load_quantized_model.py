@@ -221,6 +221,64 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
     print(f"✓ Loaded {loaded_count} parameters ({quantized_count} quantized)")
     print()
 
+    # Load any parameters from state_dict that we missed (e.g., lm_head if not in named_parameters)
+    print("Checking for missed parameters in state_dict...")
+    loaded_param_names = set()
+    for name, _ in model.named_parameters():
+        loaded_param_names.add(name)
+
+    # Track which state_dict keys are actual parameters (not quant_state metadata)
+    metadata_suffixes = ['.quant_type', '.absmax', '.blocksize', '.quant_map',
+                        '.dtype', '.shape', '.offset', '.nested_absmax',
+                        '.nested_blocksize', '.nested_quant_map']
+
+    missed_params = []
+    for key in state_dict.keys():
+        # Skip quant_state metadata
+        if any(key.endswith(suffix) for suffix in metadata_suffixes):
+            continue
+        # Skip if already loaded
+        if key in loaded_param_names:
+            continue
+        # This is a parameter we haven't loaded
+        missed_params.append(key)
+
+    if missed_params:
+        print(f"Found {len(missed_params)} parameters not loaded via named_parameters()")
+        for name in missed_params:
+            print(f"  Loading missed parameter: {name}")
+            weight_data = state_dict[name]
+
+            # Get parent module and set parameter
+            parent_module = model
+            param_path = name.split('.')
+
+            for part in param_path[:-1]:
+                if part.isdigit():
+                    parent_module = parent_module[int(part)]
+                else:
+                    parent_module = getattr(parent_module, part)
+
+            param_name = param_path[-1]
+
+            # Create parameter with correct dtype (BF16 typically)
+            # Try to infer dtype from model config or use BF16
+            dtype = getattr(config, 'torch_dtype', torch.bfloat16)
+            if dtype is None:
+                dtype = torch.bfloat16
+
+            new_param = torch.nn.Parameter(
+                weight_data.to(device=device, dtype=dtype),
+                requires_grad=False  # These are typically frozen base weights
+            )
+            setattr(parent_module, param_name, new_param)
+            loaded_count += 1
+
+        print(f"✓ Loaded {len(missed_params)} missed parameters")
+    else:
+        print("✓ No missed parameters")
+    print()
+
     # Load buffers (non-parameter tensors) from state_dict
     print("Loading buffers...")
     buffer_count = 0
