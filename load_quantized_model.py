@@ -252,6 +252,68 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
     print(f"✓ Loaded {buffer_count} buffers")
     print()
 
+    # Materialize any remaining meta tensors (parameters not in state_dict)
+    print("Checking for remaining meta tensors...")
+    meta_params = []
+    meta_buffers = []
+
+    for name, param in model.named_parameters():
+        if param.is_meta:
+            meta_params.append(name)
+
+    for name, buffer in model.named_buffers():
+        if buffer.is_meta:
+            meta_buffers.append(name)
+
+    if meta_params or meta_buffers:
+        print(f"Found {len(meta_params)} meta parameters and {len(meta_buffers)} meta buffers")
+        print("Materializing them on device...")
+
+        # Materialize meta tensors by replacing them with empty tensors on device
+        for name in meta_params:
+            parent_module = model
+            param_path = name.split('.')
+
+            for part in param_path[:-1]:
+                if part.isdigit():
+                    parent_module = parent_module[int(part)]
+                else:
+                    parent_module = getattr(parent_module, part)
+
+            param_name = param_path[-1]
+            old_param = getattr(parent_module, param_name)
+
+            # Create new parameter with zeros on device
+            new_param = torch.nn.Parameter(
+                torch.zeros(old_param.shape, dtype=old_param.dtype, device=device),
+                requires_grad=old_param.requires_grad
+            )
+            setattr(parent_module, param_name, new_param)
+            print(f"  Materialized parameter: {name}")
+
+        for name in meta_buffers:
+            parent_module = model
+            buffer_path = name.split('.')
+
+            for part in buffer_path[:-1]:
+                if part.isdigit():
+                    parent_module = parent_module[int(part)]
+                else:
+                    parent_module = getattr(parent_module, part)
+
+            buffer_name = buffer_path[-1]
+            old_buffer = getattr(parent_module, buffer_name)
+
+            # Register new buffer with zeros on device
+            parent_module.register_buffer(
+                buffer_name,
+                torch.zeros(old_buffer.shape, dtype=old_buffer.dtype, device=device)
+            )
+            print(f"  Materialized buffer: {name}")
+    else:
+        print("✓ No meta tensors found")
+
+    print()
     print("✓ Model ready on device")
     print()
 
