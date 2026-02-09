@@ -196,7 +196,8 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
 
         else:
             # Regular parameter (not quantized)
-            param.data = weight_data.to(device)
+            # Match the parameter's dtype (model may be initialized as bfloat16, etc.)
+            param.data = weight_data.to(device=device, dtype=param.dtype)
 
         loaded_count += 1
 
