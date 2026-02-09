@@ -1,0 +1,19 @@
+# BitsAndBytes Quantization for Granite MoE Models
+# Installation: pip install -r requirements.txt
+
+# Core dependencies
+torch>=2.0.0
+transformers>=4.40.0
+bitsandbytes>=0.43.0
+peft>=0.10.0
+accelerate>=0.27.0
+datasets>=2.18.0
+
+# Optional but recommended
+wandb>=0.16.0  # For experiment tracking
+sentencepiece>=0.1.99  # For Granite tokenizer
+protobuf>=3.20.0  # For tokenizer
+
+# Development (optional)
+ipython>=8.0.0  # For REPL testing
+jupyter>=1.0.0  # For notebooks
