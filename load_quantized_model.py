@@ -221,10 +221,37 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
     print(f"✓ Loaded {loaded_count} parameters ({quantized_count} quantized)")
     print()
 
-    # Move any remaining components (buffers, etc.) to device
-    # The Params4bit are already on the device from reconstruction above
-    print(f"Moving model to {device}...")
-    model = model.to(device)
+    # Load buffers (non-parameter tensors) from state_dict
+    print("Loading buffers...")
+    buffer_count = 0
+    for name, buffer in model.named_buffers():
+        if name in state_dict:
+            buffer_data = state_dict[name]
+            # Buffer might still be on meta device, need to materialize it first
+            if buffer.is_meta:
+                # Get parent module and replace buffer
+                parent_module = model
+                buffer_path = name.split('.')
+
+                for part in buffer_path[:-1]:
+                    if part.isdigit():
+                        parent_module = parent_module[int(part)]
+                    else:
+                        parent_module = getattr(parent_module, part)
+
+                buffer_name = buffer_path[-1]
+                # Register new buffer with data
+                parent_module.register_buffer(
+                    buffer_name,
+                    buffer_data.to(device=device, dtype=buffer.dtype)
+                )
+            else:
+                # Buffer already materialized, just copy data
+                buffer.copy_(buffer_data.to(device=device, dtype=buffer.dtype))
+            buffer_count += 1
+    print(f"✓ Loaded {buffer_count} buffers")
+    print()
+
     print("✓ Model ready on device")
     print()
 
