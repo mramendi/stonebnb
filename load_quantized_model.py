@@ -310,7 +310,8 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
     print(f"✓ Loaded {buffer_count} buffers")
     print()
 
-    # Materialize any remaining meta tensors (parameters not in state_dict)
+    # Materialize any remaining meta tensors
+    # BUT: if they're in state_dict, load them instead of using zeros!
     print("Checking for remaining meta tensors...")
     meta_params = []
     meta_buffers = []
@@ -325,9 +326,8 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
 
     if meta_params or meta_buffers:
         print(f"Found {len(meta_params)} meta parameters and {len(meta_buffers)} meta buffers")
-        print("Materializing them on device...")
 
-        # Materialize meta tensors by replacing them with empty tensors on device
+        # Materialize meta tensors - load from state_dict if available, else zeros
         for name in meta_params:
             parent_module = model
             param_path = name.split('.')
@@ -341,13 +341,27 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
             param_name = param_path[-1]
             old_param = getattr(parent_module, param_name)
 
-            # Create new parameter with zeros on device
-            new_param = torch.nn.Parameter(
-                torch.zeros(old_param.shape, dtype=old_param.dtype, device=device),
-                requires_grad=old_param.requires_grad
-            )
+            # Check if this parameter is in state_dict
+            if name in state_dict:
+                # Load from state_dict
+                weight_data = state_dict[name]
+                dtype = getattr(config, 'torch_dtype', torch.bfloat16)
+                if dtype is None:
+                    dtype = torch.bfloat16
+                new_param = torch.nn.Parameter(
+                    weight_data.to(device=device, dtype=dtype),
+                    requires_grad=old_param.requires_grad
+                )
+                print(f"  Loaded from state_dict: {name}")
+            else:
+                # Not in state_dict, create with zeros
+                new_param = torch.nn.Parameter(
+                    torch.zeros(old_param.shape, dtype=old_param.dtype, device=device),
+                    requires_grad=old_param.requires_grad
+                )
+                print(f"  Materialized as zeros: {name}")
+
             setattr(parent_module, param_name, new_param)
-            print(f"  Materialized parameter: {name}")
 
         for name in meta_buffers:
             parent_module = model
