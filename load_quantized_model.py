@@ -28,17 +28,29 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
     Load BnB 4-bit quantized Granite MoE model.
 
     Args:
-        model_path: Path to saved model directory
+        model_path: Path to saved model directory OR HuggingFace model ID
         device: Device to load to ("cuda" or specific like "cuda:0")
         apply_moe_patch: Whether to apply MoE quantization patches
 
     Returns:
         (model, tokenizer) tuple
     """
-    model_path = Path(model_path)
+    # Handle both local paths and HuggingFace model IDs
+    model_path_str = str(model_path)
 
-    if not model_path.exists():
-        raise ValueError(f"Model path not found: {model_path}")
+    # Check if it's a local path
+    local_path = Path(model_path)
+    if local_path.exists():
+        model_path = local_path
+    else:
+        # Try to download from HuggingFace Hub
+        print(f"Local path not found, attempting to download from HuggingFace Hub: {model_path_str}")
+        try:
+            from huggingface_hub import snapshot_download
+            model_path = Path(snapshot_download(repo_id=model_path_str))
+            print(f"✓ Downloaded to: {model_path}")
+        except Exception as e:
+            raise ValueError(f"Model path not found locally and failed to download from HuggingFace Hub: {model_path_str}\nError: {e}")
 
     print("="*80)
     print("LOADING BNB 4-BIT QUANTIZED GRANITE MOE")
