@@ -100,14 +100,13 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
     print(f"✓ Loaded {len(state_dict)} parameters")
     print()
 
-    # Move model to device (empty - no weight data yet)
-    print(f"Preparing model on {device}...")
-    model = model.to_empty(device=device)
-    print("✓ Model prepared")
-    print()
+    # NOTE: Do NOT call .to_empty(device) here!
+    # That would allocate the full unquantized model structure on GPU before we've
+    # had a chance to reconstruct the Params4bit tensors. Instead, we keep the model
+    # on CPU and move parameters to device as we load them.
 
     # Load weights
-    print("Loading quantized weights...")
+    print(f"Loading quantized weights to {device}...")
     loaded_count = 0
     quantized_count = 0
 
@@ -203,6 +202,13 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
 
     print()
     print(f"✓ Loaded {loaded_count} parameters ({quantized_count} quantized)")
+    print()
+
+    # Move any remaining components (buffers, etc.) to device
+    # The Params4bit are already on the device from reconstruction above
+    print(f"Moving model to {device}...")
+    model = model.to(device)
+    print("✓ Model ready on device")
     print()
 
     # Load tokenizer
