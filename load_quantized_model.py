@@ -196,8 +196,24 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
 
         else:
             # Regular parameter (not quantized)
-            # Match the parameter's dtype (model may be initialized as bfloat16, etc.)
-            param.data = weight_data.to(device=device, dtype=param.dtype)
+            # Create new parameter with loaded data (matches dtype and device)
+            new_param = torch.nn.Parameter(
+                weight_data.to(device=device, dtype=param.dtype),
+                requires_grad=param.requires_grad
+            )
+
+            # Replace the parameter entirely (same as quantized path)
+            parent_module = model
+            param_path = name.split('.')
+
+            for part in param_path[:-1]:
+                if part.isdigit():
+                    parent_module = parent_module[int(part)]
+                else:
+                    parent_module = getattr(parent_module, part)
+
+            param_name = param_path[-1]
+            setattr(parent_module, param_name, new_param)
 
         loaded_count += 1
 
