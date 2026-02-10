@@ -105,17 +105,46 @@ class MoELinear4Bit(torch.autograd.Function):
         return grad_inputs, None, None, None, None
 
 
+class Dequantize4BitSlice(torch.autograd.Function):
+    """
+    Custom autograd function to dequantize and extract a slice while allowing GC.
+
+    The key insight: Normal .clone() on the slice still keeps a reference to the
+    parent through PyTorch's autograd graph. This custom Function breaks that
+    connection by explicitly handling forward/backward.
+    """
+    @staticmethod
+    def forward(ctx, quantized_data, quant_state, index):
+        import bitsandbytes.functional as bnb_F
+
+        # Dequantize full tensor (temporarily allocated)
+        full_dequant = bnb_F.dequantize_4bit(quantized_data, quant_state=quant_state)
+
+        # Extract and clone slice
+        result = full_dequant[index].clone()
+
+        # Save cloned slice for backward (NOT the parent)
+        ctx.save_for_backward(result)
+
+        # full_dequant goes out of scope → garbage collected
+        return result
+
+    @staticmethod
+    def backward(ctx, grad_output):
+        # Weights are frozen (`requires_grad=False`)
+        # We don't compute gradients for quantized_data or quant_state
+        # Gradients flow through the computation graph normally via the returned tensor
+        return None, None, None
+
+
 def patch_params4bit_getitem():
     """
     Add __getitem__ support to Params4bit for MoE indexing.
 
-    This is a fallback in case MoELinear4Bit doesn't get called.
-    Allows weight[i] on 3D quantized tensors (though inefficient - use MoELinear4Bit instead).
-
-    Safe to call multiple times (idempotent).
+    Uses custom autograd Function to properly break parent tensor reference
+    while maintaining gradient flow.
     """
     from bitsandbytes.nn import Params4bit
-    import bitsandbytes.functional as bnb_F
 
     # Check if already patched
     if hasattr(Params4bit.__getitem__, '_moe_patched'):
@@ -128,10 +157,7 @@ def patch_params4bit_getitem():
         """
         Support indexing into 4-bit quantized tensors, e.g., for MoE experts.
 
-        Clones the slice to detach it from the parent tensor, allowing the
-        full dequantized tensor to be garbage collected immediately.
-
-        This reduces memory from 906 MB (full tensor) to ~12.6 MB (single expert).
+        Uses custom autograd Function to allow parent tensor garbage collection.
         """
         if not self.bnb_quantized or self.quant_state is None:
             # Not quantized, use parent behavior if available
@@ -140,19 +166,8 @@ def patch_params4bit_getitem():
             else:
                 return super(Params4bit, self).__getitem__(index)
 
-        # Dequantize full tensor (temporarily allocates full size)
-        full_dequant = bnb_F.dequantize_4bit(self.data, quant_state=self.quant_state)
-
-        # Slice to get the requested expert (view into parent)
-        result = full_dequant[index]
-
-        # CRITICAL: Use contiguous() instead of clone() to break memory dependency
-        # while preserving the autograd graph
-        # contiguous() creates a new memory layout if needed, allowing full_dequant to be freed
-        result = result.contiguous()
-
-        # full_dequant is now eligible for garbage collection
-        return result
+        # Use custom autograd Function
+        return Dequantize4BitSlice.apply(self.data, self.quant_state, index)
 
     # Mark as patched
     quantized_getitem._moe_patched = True
@@ -160,7 +175,7 @@ def patch_params4bit_getitem():
     # Apply the patch
     Params4bit.__getitem__ = quantized_getitem
 
-    print("✓ Added __getitem__ support to Params4bit for MoE indexing (clone-and-release)")
+    print("✓ Added __getitem__ support to Params4bit for MoE indexing (custom autograd)")
     return True
 
 
@@ -214,11 +229,23 @@ def patch_granite_moe_for_quantization():
                 self.num_experts            # Number of experts
             )
         else:
-            # Fall back to original implementation for non-quantized weights
+            # Fall back for non-quantized OR when quantized but accessed via __getitem__
+            # CRITICAL: Dequantize ONCE before loop to avoid repeated full dequantization
+            from bitsandbytes.nn import Params4bit
+            import bitsandbytes.functional as bnb_F
+
+            if isinstance(self.weight, Params4bit) and hasattr(self.weight, 'bnb_quantized') and self.weight.bnb_quantized:
+                # Dequantize once before the loop
+                full_weight = bnb_F.dequantize_4bit(self.weight.data, quant_state=self.weight.quant_state)
+            else:
+                # Already dequantized
+                full_weight = self.weight
+
+            # Use dequantized weight for all experts
             input_list = inputs.split(expert_size, dim=0)
             output_list = []
             for i in range(self.num_experts):
-                output_list.append(F.linear(input_list[i], self.weight[i]))
+                output_list.append(F.linear(input_list[i], full_weight[i]))
             return torch.cat(output_list, dim=0)
 
     # Mark as patched to avoid double-patching
