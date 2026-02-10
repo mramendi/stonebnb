@@ -105,19 +105,29 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
     print()
 
     # Create model structure (on meta device to avoid memory allocation)
-    # CRITICAL: Pass attn_implementation during model creation, not after!
+    # CRITICAL: Set _attn_implementation on config BEFORE creating model!
     print("Creating model structure...")
+    if use_flash_attn:
+        config._attn_implementation = "flash_attention_2"
+        print(f"DEBUG: Set config._attn_implementation = {config._attn_implementation}")
+
     with torch.device("meta"):
-        if use_flash_attn:
-            model = AutoModelForCausalLM.from_config(
-                config,
-                trust_remote_code=True,
-                attn_implementation="flash_attention_2"
-            )
+        model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
+
+    # Check if the setting was preserved
+    actual_attn = getattr(model.config, '_attn_implementation', 'NOT SET')
+    print(f"DEBUG: After model creation, model.config._attn_implementation = {actual_attn}")
+
+    if use_flash_attn:
+        if actual_attn == "flash_attention_2":
             print("✓ Model structure created with Flash Attention 2")
         else:
-            model = AutoModelForCausalLM.from_config(config, trust_remote_code=True)
-            print("✓ Model structure created (eager attention)")
+            print(f"⚠️  WARNING: Tried to set FA2 but model has: {actual_attn}")
+            print("  Attempting to force-set it on the model...")
+            model.config._attn_implementation = "flash_attention_2"
+            print(f"  model.config._attn_implementation now = {model.config._attn_implementation}")
+    else:
+        print("✓ Model structure created (eager attention)")
     print()
 
     # Load state_dict
