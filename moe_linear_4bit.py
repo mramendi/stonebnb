@@ -146,9 +146,10 @@ def patch_params4bit_getitem():
         # Slice to get the requested expert (view into parent)
         result = full_dequant[index]
 
-        # Clone to create independent copy (detaches from parent tensor)
-        # This allows full_dequant to be garbage collected, freeing memory
-        result = result.clone()
+        # CRITICAL: Use contiguous() instead of clone() to break memory dependency
+        # while preserving the autograd graph
+        # contiguous() creates a new memory layout if needed, allowing full_dequant to be freed
+        result = result.contiguous()
 
         # full_dequant is now eligible for garbage collection
         return result
