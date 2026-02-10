@@ -7,8 +7,9 @@ However, with the IBM Granite 4 Small and Tiny models (Mamba2-hybrid, MoE) qLoRA
 
 The result is that one normally needs a GPU with VRAM to fit the entire unquantized BF16 model (so 64 Gb just for the weights of Granite 4 small, before any overhead for actual training). Or maybe a Hopper/Blackwell chip allows  FP8 qLoRA - but for Granite 4 Small, that is still 32 Gb, leaving zero space for training on a 5090.
 
-We propose a method of using bitsandbytes with some custom scaffolding and a custom model saving format to quantize the MLP layers in the experts to 4 bits, enabling memory-efficient training. **This is not qLoRA** - the quantized layers cannot be trained, the layers you train are not quantized. However, training only the attention and Mamba layers is a very common fine-tuning approach with Granite. StoneBnB enables this method with significantly less VRAM; the model is pre-quantized on a large-VRAM GPU, then can be trained and tested on a much smaller one, with the final merge of teh adapter into the original model on the large GPU again.
+We propose a method of using bitsandbytes with some custom scaffolding and a custom model saving format to quantize the MLP layers in the experts to 4 bits, enabling memory-efficient training. **This is not qLoRA** - the quantized layers cannot be trained, the layers you train are not quantized. However, training only the attention and Mamba layers is a very common fine-tuning approach with Granite. StoneBnB enables this method with significantly less VRAM; the model is pre-quantized on a large-VRAM GPU, then can be trained and tested on a much smaller one, with the final merge of the adapter into the original model on the large GPU again.
 
+The main drawback we observe so far is a significant speed penalty. However this frammerosk was NOT properly tested yet. Try at your own risk.
 
 ![mamba in a stone wall](https://d25f54r5k7x61w.archive.is/kGCOh/2311be5f87eb726cb68ecdc961879ff82d11b33a.jpg)
 (image credit: [Nick Evans](https://www.citizen.co.za/news/south-africa/black-mamba-caught-after-hiding-in-wall-of-house-for-weeks/))
