@@ -442,48 +442,22 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
     print()
 
     # POST-LOAD PATCH: Directly patch the MoE expert layers in the loaded model
-    print(f"\n[DEBUG] Post-load patch check: apply_moe_patch={apply_moe_patch}")
-
     if apply_moe_patch:
-        print("="*80)
-        print("APPLYING POST-LOAD MOE PATCHES")
-        print("="*80)
         from moe_linear_4bit import MoELinear4Bit
         import types
-
-        # First, list all modules to see what we have
-        print("Scanning model for MoE layers...")
-        all_module_types = set()
-        for name, module in model.named_modules():
-            all_module_types.add(module.__class__.__name__)
-            if 'moe' in name.lower() or 'expert' in name.lower():
-                print(f"  {name}: {module.__class__.__name__}")
-
-        print(f"\nAll unique module types found: {sorted(all_module_types)}")
-        print()
 
         patched_count = 0
         for name, module in model.named_modules():
             # Look for GraniteMoeHybridParallelExperts or GraniteMoeParallelExperts
-            if 'ParallelExperts' in module.__class__.__name__ or 'MoeHybrid' in name:
-                print(f"  Found MoE layer: {name}")
-                print(f"    Class: {module.__class__.__name__}")
-                print(f"    Module: {module.__class__.__module__}")
-                print(f"    Has weight: {hasattr(module, 'weight')}")
-                if hasattr(module, 'weight'):
-                    print(f"    Weight type: {type(module.weight)}")
-
+            if 'ParallelExperts' in module.__class__.__name__:
                 # Create patched forward function
                 def make_patched_forward(mod):
                     def patched_forward(self, inputs, expert_size):
                         from bitsandbytes.nn import Params4bit
 
-                        print(f"[PATCH] Patched forward called for {mod.__class__.__name__}")
-
                         # Check if weights are quantized
                         if isinstance(self.weight, Params4bit) and hasattr(self.weight, 'quant_state') and self.weight.quant_state is not None:
-                            print(f"[PATCH] Using MoELinear4Bit path")
-                            # Use MoELinear4Bit path
+                            # Use memory-efficient MoELinear4Bit path
                             return MoELinear4Bit.apply(
                                 inputs,
                                 self.weight.data,
@@ -492,8 +466,7 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
                                 self.num_experts
                             )
                         else:
-                            print(f"[PATCH] Using original forward (not quantized)")
-                            # Need to call the original unbound method
+                            # Fallback to original unpatched forward
                             return mod.__class__.forward(self, inputs, expert_size)
 
                     return patched_forward
@@ -504,9 +477,15 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
                 patched_count += 1
 
         if patched_count > 0:
-            print(f"✓ Patched {patched_count} MoE expert layers")
+            print(f"✓ Patched {patched_count} MoE expert layers for memory-efficient training")
         else:
-            print("⚠️  No MoE expert layers found to patch")
+            print("="*80)
+            print("⚠️  WARNING: NO MOE EXPERT LAYERS FOUND TO PATCH!")
+            print("="*80)
+            print("Training will use the original transformers code which may:")
+            print("  - Use significantly more VRAM (dequantized weights saved to autograd)")
+            print("  - Cause OOM on long sequences")
+            print("="*80)
         print()
 
     return model, tokenizer

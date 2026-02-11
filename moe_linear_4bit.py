@@ -168,23 +168,14 @@ def patch_params4bit_getitem():
 
         Uses custom autograd Function to allow parent tensor garbage collection.
         """
-        import traceback
-
-        print(f"[DEBUG] quantized_getitem called: index={index}, quantized={self.bnb_quantized if hasattr(self, 'bnb_quantized') else 'N/A'}")
-        print(f"[DEBUG] Caller stack:")
-        for line in traceback.format_stack()[-4:-1]:  # Show last 3 stack frames
-            print(f"  {line.strip()}")
-
         if not self.bnb_quantized or self.quant_state is None:
             # Not quantized, use parent behavior if available
-            print(f"[DEBUG] → Using parent __getitem__ (not quantized)")
             if original_getitem:
                 return original_getitem(self, index)
             else:
                 return super(Params4bit, self).__getitem__(index)
 
         # Use custom autograd Function
-        print(f"[DEBUG] → Using Dequantize4BitSlice.apply")
         return Dequantize4BitSlice.apply(self.data, self.quant_state, index)
 
     # Mark as patched
@@ -220,14 +211,8 @@ def patch_granite_moe_for_quantization():
 
     # Check if already patched
     if hasattr(GraniteMoeParallelExperts.forward, '_quantization_patched'):
-        print("GraniteMoeParallelExperts already patched for quantization")
-        print(f"  Class: {GraniteMoeParallelExperts}")
-        print(f"  Forward method: {GraniteMoeParallelExperts.forward}")
+        # Already patched, skip
         return True
-
-    print(f"Patching class: {GraniteMoeParallelExperts}")
-    print(f"  Module: {GraniteMoeParallelExperts.__module__}")
-    print(f"  Original forward: {GraniteMoeParallelExperts.forward}")
 
     # Save original forward method
     original_forward = GraniteMoeParallelExperts.forward
