@@ -53,10 +53,14 @@ class MoELinear4Bit(torch.autograd.Function):
         input_list = inputs.split(expert_size, dim=0)
 
         # Process each expert with its slice of the dequantized weight
+        # CRITICAL: Use matmul directly instead of F.linear to prevent PyTorch
+        # from creating intermediate autograd nodes that save dequantized weights.
+        # F.linear(input, weight) is equivalent to: input @ weight.T
         output_list = []
         for i in range(num_experts):
             # Use the i-th expert's weights (2D slice)
-            output_list.append(F.linear(input_list[i], weight_full[i]))
+            # matmul doesn't create a separate autograd node - we control the backward
+            output_list.append(torch.matmul(input_list[i], weight_full[i].t()))
 
         # Concatenate outputs
         result = torch.cat(output_list, dim=0)
@@ -159,14 +163,23 @@ def patch_params4bit_getitem():
 
         Uses custom autograd Function to allow parent tensor garbage collection.
         """
+        import traceback
+
+        print(f"[DEBUG] quantized_getitem called: index={index}, quantized={self.bnb_quantized if hasattr(self, 'bnb_quantized') else 'N/A'}")
+        print(f"[DEBUG] Caller stack:")
+        for line in traceback.format_stack()[-4:-1]:  # Show last 3 stack frames
+            print(f"  {line.strip()}")
+
         if not self.bnb_quantized or self.quant_state is None:
             # Not quantized, use parent behavior if available
+            print(f"[DEBUG] → Using parent __getitem__ (not quantized)")
             if original_getitem:
                 return original_getitem(self, index)
             else:
                 return super(Params4bit, self).__getitem__(index)
 
         # Use custom autograd Function
+        print(f"[DEBUG] → Using Dequantize4BitSlice.apply")
         return Dequantize4BitSlice.apply(self.data, self.quant_state, index)
 
     # Mark as patched
@@ -221,6 +234,7 @@ def patch_granite_moe_for_quantization():
         # Check if weights are quantized
         if isinstance(self.weight, Params4bit) and hasattr(self.weight, 'quant_state') and self.weight.quant_state is not None:
             # Use memory-efficient quantized path
+            print(f"[DEBUG] Using MoELinear4Bit path")
             return MoELinear4Bit.apply(
                 inputs,
                 self.weight.data,           # Quantized weight tensor
@@ -242,10 +256,11 @@ def patch_granite_moe_for_quantization():
                 full_weight = self.weight
 
             # Use dequantized weight for all experts
+            # Use matmul instead of F.linear to avoid saving dequantized weights to autograd graph
             input_list = inputs.split(expert_size, dim=0)
             output_list = []
             for i in range(self.num_experts):
-                output_list.append(F.linear(input_list[i], full_weight[i]))
+                output_list.append(torch.matmul(input_list[i], full_weight[i].t()))
             return torch.cat(output_list, dim=0)
 
     # Mark as patched to avoid double-patching
