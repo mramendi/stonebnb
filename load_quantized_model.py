@@ -427,10 +427,14 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
 
     # Load tokenizer
     print("Loading tokenizer...")
-    tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(
+        model_path,
+        trust_remote_code=True,
+        fix_mistral_regex=True  # Fix incorrect Mistral tokenizer regex pattern
+    )
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
-    print("✓ Tokenizer loaded")
+    print("✓ Tokenizer loaded (with Mistral regex fix)")
     print()
 
     print("="*80)
