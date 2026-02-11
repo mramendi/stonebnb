@@ -113,9 +113,13 @@ class Dequantize4BitSlice(torch.autograd.Function):
     """
     Custom autograd function to dequantize and extract a slice while allowing GC.
 
-    The key insight: Normal .clone() on the slice still keeps a reference to the
-    parent through PyTorch's autograd graph. This custom Function breaks that
-    connection by explicitly handling forward/backward.
+    CRITICAL: We DON'T save the dequantized slice to ctx because:
+    1. Weights are frozen - no gradient computation needed
+    2. The caller (F.linear in transformers) will save it for its own backward
+    3. Saving here would mean double VRAM usage (once here, once in F.linear)
+
+    This at least prevents DOUBLE-saving the weights to autograd graph.
+    (We can't prevent F.linear from saving them without patching transformers)
     """
     @staticmethod
     def forward(ctx, quantized_data, quant_state, index):
@@ -127,8 +131,9 @@ class Dequantize4BitSlice(torch.autograd.Function):
         # Extract and clone slice
         result = full_dequant[index].clone()
 
-        # Save cloned slice for backward (NOT the parent)
-        ctx.save_for_backward(result)
+        # DON'T save anything to ctx!
+        # F.linear will save the weight for its backward - we can't prevent that.
+        # But at least we're not saving it TWICE (once here, once in F.linear).
 
         # full_dequant goes out of scope → garbage collected
         return result
@@ -137,7 +142,7 @@ class Dequantize4BitSlice(torch.autograd.Function):
     def backward(ctx, grad_output):
         # Weights are frozen (`requires_grad=False`)
         # We don't compute gradients for quantized_data or quant_state
-        # Gradients flow through the computation graph normally via the returned tensor
+        # grad_output flows through from F.linear's backward, we just pass None back
         return None, None, None
 
 
@@ -216,7 +221,13 @@ def patch_granite_moe_for_quantization():
     # Check if already patched
     if hasattr(GraniteMoeParallelExperts.forward, '_quantization_patched'):
         print("GraniteMoeParallelExperts already patched for quantization")
+        print(f"  Class: {GraniteMoeParallelExperts}")
+        print(f"  Forward method: {GraniteMoeParallelExperts.forward}")
         return True
+
+    print(f"Patching class: {GraniteMoeParallelExperts}")
+    print(f"  Module: {GraniteMoeParallelExperts.__module__}")
+    print(f"  Original forward: {GraniteMoeParallelExperts.forward}")
 
     # Save original forward method
     original_forward = GraniteMoeParallelExperts.forward
@@ -234,7 +245,6 @@ def patch_granite_moe_for_quantization():
         # Check if weights are quantized
         if isinstance(self.weight, Params4bit) and hasattr(self.weight, 'quant_state') and self.weight.quant_state is not None:
             # Use memory-efficient quantized path
-            print(f"[DEBUG] Using MoELinear4Bit path")
             return MoELinear4Bit.apply(
                 inputs,
                 self.weight.data,           # Quantized weight tensor
