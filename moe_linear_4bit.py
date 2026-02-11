@@ -162,12 +162,33 @@ def patch_params4bit_getitem():
     # Save original __getitem__ if it exists
     original_getitem = getattr(Params4bit, '__getitem__', None)
 
+    # Global flag to track if regression warning has been shown
+    _regression_warning_shown = [False]  # Use list so it's mutable in closure
+
     def quantized_getitem(self, index):
         """
         Support indexing into 4-bit quantized tensors, e.g., for MoE experts.
 
         Uses custom autograd Function to allow parent tensor garbage collection.
         """
+        # REGRESSION CONTROL: Warn if this fallback path is used (means patching failed)
+        if not _regression_warning_shown[0]:
+            _regression_warning_shown[0] = True
+            print()
+            print("="*80)
+            print("⚠️  REGRESSION WARNING: Params4bit.__getitem__ FALLBACK PATH ACTIVE")
+            print("="*80)
+            print("The MoELinear4Bit patch is NOT being used!")
+            print("This means:")
+            print("  - Dequantized weights ARE being saved to autograd graph")
+            print("  - Training will be MUCH slower (~2.5x slower)")
+            print("  - You may run out of VRAM on long sequences")
+            print()
+            print("This likely means the post-load patching in load_quantized_model() failed.")
+            print("Check that you see: '✓ Patched N MoE expert layers' during model load.")
+            print("="*80)
+            print()
+
         if not self.bnb_quantized or self.quant_state is None:
             # Not quantized, use parent behavior if available
             if original_getitem:
