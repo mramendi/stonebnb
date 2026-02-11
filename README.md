@@ -86,8 +86,9 @@ python train_lora.py \
 python
 >>> from load_quantized_model import load_quantized_model
 >>> from peft import PeftModel
->>> base_model, tokenizer = load_quantized_model("./granite-small-quantized") 
+>>> base_model, tokenizer = load_quantized_model("./granite-small-quantized")
 # or: base_model, tokenizer = load_quantized_model("ramendik/granite-4.0-h-small-stonebnb")
+# Note: load_quantized_model() automatically patches MoE layers for memory-efficient training
 >>> model = PeftModel.from_pretrained(base_model, "./output/final")
 
 # 4. Merge adapter into original model (requires high-VRAM machine again)

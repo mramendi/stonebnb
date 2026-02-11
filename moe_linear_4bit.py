@@ -53,10 +53,14 @@ class MoELinear4Bit(torch.autograd.Function):
         input_list = inputs.split(expert_size, dim=0)
 
         # Process each expert with its slice of the dequantized weight
+        # CRITICAL: Use matmul directly instead of F.linear to prevent PyTorch
+        # from creating intermediate autograd nodes that save dequantized weights.
+        # F.linear(input, weight) is equivalent to: input @ weight.T
         output_list = []
         for i in range(num_experts):
             # Use the i-th expert's weights (2D slice)
-            output_list.append(F.linear(input_list[i], weight_full[i]))
+            # matmul doesn't create a separate autograd node - we control the backward
+            output_list.append(torch.matmul(input_list[i], weight_full[i].t()))
 
         # Concatenate outputs
         result = torch.cat(output_list, dim=0)
@@ -109,9 +113,13 @@ class Dequantize4BitSlice(torch.autograd.Function):
     """
     Custom autograd function to dequantize and extract a slice while allowing GC.
 
-    The key insight: Normal .clone() on the slice still keeps a reference to the
-    parent through PyTorch's autograd graph. This custom Function breaks that
-    connection by explicitly handling forward/backward.
+    CRITICAL: We DON'T save the dequantized slice to ctx because:
+    1. Weights are frozen - no gradient computation needed
+    2. The caller (F.linear in transformers) will save it for its own backward
+    3. Saving here would mean double VRAM usage (once here, once in F.linear)
+
+    This at least prevents DOUBLE-saving the weights to autograd graph.
+    (We can't prevent F.linear from saving them without patching transformers)
     """
     @staticmethod
     def forward(ctx, quantized_data, quant_state, index):
@@ -123,8 +131,9 @@ class Dequantize4BitSlice(torch.autograd.Function):
         # Extract and clone slice
         result = full_dequant[index].clone()
 
-        # Save cloned slice for backward (NOT the parent)
-        ctx.save_for_backward(result)
+        # DON'T save anything to ctx!
+        # F.linear will save the weight for its backward - we can't prevent that.
+        # But at least we're not saving it TWICE (once here, once in F.linear).
 
         # full_dequant goes out of scope → garbage collected
         return result
@@ -133,7 +142,7 @@ class Dequantize4BitSlice(torch.autograd.Function):
     def backward(ctx, grad_output):
         # Weights are frozen (`requires_grad=False`)
         # We don't compute gradients for quantized_data or quant_state
-        # Gradients flow through the computation graph normally via the returned tensor
+        # grad_output flows through from F.linear's backward, we just pass None back
         return None, None, None
 
 
@@ -153,12 +162,33 @@ def patch_params4bit_getitem():
     # Save original __getitem__ if it exists
     original_getitem = getattr(Params4bit, '__getitem__', None)
 
+    # Global flag to track if regression warning has been shown
+    _regression_warning_shown = [False]  # Use list so it's mutable in closure
+
     def quantized_getitem(self, index):
         """
         Support indexing into 4-bit quantized tensors, e.g., for MoE experts.
 
         Uses custom autograd Function to allow parent tensor garbage collection.
         """
+        # REGRESSION CONTROL: Warn if this fallback path is used (means patching failed)
+        if not _regression_warning_shown[0]:
+            _regression_warning_shown[0] = True
+            print()
+            print("="*80)
+            print("⚠️  REGRESSION WARNING: Params4bit.__getitem__ FALLBACK PATH ACTIVE")
+            print("="*80)
+            print("The MoELinear4Bit patch is NOT being used!")
+            print("This means:")
+            print("  - Dequantized weights ARE being saved to autograd graph")
+            print("  - Training will be MUCH slower (~2.5x slower)")
+            print("  - You may run out of VRAM on long sequences")
+            print()
+            print("This likely means the post-load patching in load_quantized_model() failed.")
+            print("Check that you see: '✓ Patched N MoE expert layers' during model load.")
+            print("="*80)
+            print()
+
         if not self.bnb_quantized or self.quant_state is None:
             # Not quantized, use parent behavior if available
             if original_getitem:
@@ -202,7 +232,7 @@ def patch_granite_moe_for_quantization():
 
     # Check if already patched
     if hasattr(GraniteMoeParallelExperts.forward, '_quantization_patched'):
-        print("GraniteMoeParallelExperts already patched for quantization")
+        # Already patched, skip
         return True
 
     # Save original forward method
@@ -242,10 +272,11 @@ def patch_granite_moe_for_quantization():
                 full_weight = self.weight
 
             # Use dequantized weight for all experts
+            # Use matmul instead of F.linear to avoid saving dequantized weights to autograd graph
             input_list = inputs.split(expert_size, dim=0)
             output_list = []
             for i in range(self.num_experts):
-                output_list.append(F.linear(input_list[i], full_weight[i]))
+                output_list.append(torch.matmul(input_list[i], full_weight[i].t()))
             return torch.cat(output_list, dim=0)
 
     # Mark as patched to avoid double-patching
