@@ -290,12 +290,17 @@ def setup_model_for_training(
         # Default: Target attention and mamba layers (Granite's hybrid architecture)
         # For Granite models, we target:
         # - Attention: q_proj, k_proj, v_proj, o_proj (standard transformer attention)
-        # - Mamba: in_proj, out_proj (state space model components)
+        # - Mamba: in_proj only (out_proj excluded - fused kernel bypasses LoRA)
+        #
+        # NOTE: mamba.out_proj is excluded because the mamba_split_conv1d_scan_combined
+        # fused CUDA kernel passes out_proj.weight directly to the kernel, never calling
+        # the nn.Module wrapper, so LoRA adapters on out_proj are never used during training.
         target_modules = [
             "q_proj", "k_proj", "v_proj", "o_proj",  # Attention
-            "mamba.in_proj", "mamba.out_proj",        # Mamba (SSM)
+            "mamba.in_proj",                          # Mamba in_proj (out_proj excluded)
         ]
-        print("\n3. Using default target modules (Attention + Mamba):")
+        print("\n3. Using default target modules (Attention + Mamba in_proj):")
+        print("   Note: mamba.out_proj excluded - fused kernel bypasses LoRA")
     else:
         print("\n3. Using custom target modules:")
 
