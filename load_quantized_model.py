@@ -21,9 +21,15 @@ from bitsandbytes.nn import Params4bit
 from bitsandbytes.functional import QuantState
 
 from moe_linear_4bit import apply_all_patches
+from expert_weight_storage import (
+    GlobalExpertCache,
+    QuantizedExpertSource,
+    ExpertWeightRegistry
+)
+from weight_reference import WeightReference, extract_layer_info_from_name
 
 
-def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
+def load_quantized_model(model_path, device="cuda", apply_moe_patch=True, cache_size=20):
     """
     Load BnB 4-bit quantized Granite MoE model.
 
@@ -31,6 +37,10 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
         model_path: Path to saved model directory OR HuggingFace model ID
         device: Device to load to ("cuda" or specific like "cuda:0")
         apply_moe_patch: Whether to apply MoE quantization patches
+        cache_size: Global LRU cache size for expert weights (default: 20)
+                   - 10: Minimal (~700MB), covers ~5 experts per layer
+                   - 20: Balanced (~1.4GB), covers ~10 experts × 2 layers
+                   - 40-80: Aggressive (~2.8-5.6GB), caches multiple layers
 
     Returns:
         (model, tokenizer) tuple
@@ -56,6 +66,12 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
     print("LOADING BNB 4-BIT QUANTIZED GRANITE MOE")
     print("="*80)
     print(f"Path: {model_path}")
+    print(f"Global cache size: {cache_size} experts (~{cache_size * 70:.0f}MB)")
+    print()
+
+    # Initialize global expert cache
+    GlobalExpertCache.get_instance(max_entries=cache_size)
+    print(f"✓ Initialized global LRU cache (size={cache_size})")
     print()
 
     # Apply MoE patches if requested (BEFORE model creation)
@@ -225,8 +241,26 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
 
             quantized_count += 1
 
+            # NEW: Create QuantizedExpertSource if this is a 3D MoE expert weight
             if info["is_3d"]:
                 print(f"  Loaded 3D quantized: {name} {original_shape}")
+
+                # Extract layer info from parameter name
+                layer_info = extract_layer_info_from_name(name)
+                if layer_info is not None:
+                    layer_idx, weight_type = layer_info
+
+                    # Create source with reference to the Params4bit object in model
+                    # CRITICAL: This is a Python reference, NOT a copy!
+                    # Single source of truth: the quantized_param we just set in the model
+                    source = QuantizedExpertSource(
+                        params4bit_ref=quantized_param,  # Reference to model's parameter
+                        layer_idx=layer_idx,
+                        weight_type=weight_type
+                    )
+
+                    # Register in global registry
+                    ExpertWeightRegistry.register(layer_idx, weight_type, source)
             else:
                 print(f"  Loaded 2D quantized: {name} {original_shape}")
 
@@ -445,43 +479,50 @@ def load_quantized_model(model_path, device="cuda", apply_moe_patch=True):
     print(f"Device: {device}")
     print()
 
-    # POST-LOAD PATCH: Directly patch the MoE expert layers in the loaded model
+    # POST-LOAD PATCH: Attach WeightReference to MoE expert layers
     if apply_moe_patch:
         from moe_linear_4bit import MoELinear4Bit
+        from bitsandbytes.nn import Params4bit
         import types
 
         patched_count = 0
         for name, module in model.named_modules():
             # Look for GraniteMoeHybridParallelExperts or GraniteMoeParallelExperts
             if 'ParallelExperts' in module.__class__.__name__:
-                # Create patched forward function
-                def make_patched_forward(mod):
-                    def patched_forward(self, inputs, expert_size):
-                        from bitsandbytes.nn import Params4bit
+                # Check if this module has quantized weights (Params4bit)
+                if isinstance(module.weight, Params4bit) and hasattr(module.weight, 'quant_state') and module.weight.quant_state is not None:
+                    # Extract layer info from module name
+                    # name format: "model.layers.0.block_sparse_moe.input_linear" (or output_linear)
+                    if "input_linear" in name:
+                        weight_type = "input_linear"
+                    elif "output_linear" in name:
+                        weight_type = "output_linear"
+                    else:
+                        # Unknown weight type, skip
+                        continue
 
-                        # Check if weights are quantized
-                        if isinstance(self.weight, Params4bit) and hasattr(self.weight, 'quant_state') and self.weight.quant_state is not None:
-                            # Use memory-efficient MoELinear4Bit path
-                            return MoELinear4Bit.apply(
-                                inputs,
-                                self.weight.data,
-                                self.weight.quant_state,
-                                expert_size,
-                                self.num_experts
-                            )
-                        else:
-                            # Fallback to original unpatched forward
-                            return mod.__class__.forward(self, inputs, expert_size)
+                    # Extract layer index
+                    parts = name.split('.')
+                    try:
+                        layers_idx = parts.index('layers')
+                        layer_idx = int(parts[layers_idx + 1])
+                    except (ValueError, IndexError):
+                        # Could not extract layer index, skip
+                        continue
 
-                    return patched_forward
+                    # Create WeightReference and attach to module
+                    weight_ref = WeightReference(layer_idx, weight_type)
+                    module._weight_ref = weight_ref
 
-                # Bind the patched method to the instance using types.MethodType
-                patched_method = types.MethodType(make_patched_forward(module), module)
-                module.forward = patched_method
-                patched_count += 1
+                    patched_count += 1
+
+        # Report registered sources and patched modules
+        registry_count = ExpertWeightRegistry.count()
+        print(f"✓ Registered {registry_count} expert weight sources in global registry")
 
         if patched_count > 0:
-            print(f"✓ Patched {patched_count} MoE expert layers for memory-efficient training")
+            print(f"✓ Attached WeightReference to {patched_count} MoE expert layers")
+            print(f"  Virtual weight system active: lazy per-expert dequantization with LRU cache")
         else:
             print("="*80)
             print("⚠️  WARNING: NO MOE EXPERT LAYERS FOUND TO PATCH!")

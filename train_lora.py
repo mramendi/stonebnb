@@ -360,7 +360,7 @@ def setup_model_for_training(
 # ============================================================================
 
 class MemoryLoggingCallback(TrainerCallback):
-    """Log GPU memory usage during training."""
+    """Log GPU memory usage and cache statistics during training."""
 
     def on_log(self, args, state, control, logs=None, **kwargs):
         if logs and torch.cuda.is_available():
@@ -368,6 +368,16 @@ class MemoryLoggingCallback(TrainerCallback):
             reserved_gb = torch.cuda.memory_reserved(0) / 1e9
             logs["gpu_memory_allocated_gb"] = allocated_gb
             logs["gpu_memory_reserved_gb"] = reserved_gb
+
+            # Add cache statistics
+            try:
+                from expert_weight_storage import GlobalExpertCache
+                stats = GlobalExpertCache.get_stats()
+                logs["cache_hit_rate"] = stats["hit_rate"]
+                logs["cache_entries"] = stats["cached_entries"]
+            except Exception:
+                # Cache not initialized or not available
+                pass
 
 
 # ============================================================================
@@ -446,6 +456,8 @@ Dataset format (JSONL):
                        help="Resume training from checkpoint")
     parser.add_argument("--wandb-project", type=str, default=None,
                        help="Weights & Biases project name (optional)")
+    parser.add_argument("--cache-size", type=int, default=20,
+                       help="Global LRU cache size for expert weights (default: 20)")
 
     args = parser.parse_args()
 
@@ -467,6 +479,7 @@ Dataset format (JSONL):
     print(f"  Learning rate: {args.learning_rate}")
     print(f"  LoRA rank: {args.rank}")
     print(f"  LoRA alpha: {args.alpha}")
+    print(f"  Cache size: {args.cache_size} experts (~{args.cache_size * 70:.0f}MB)")
     print()
 
     # ========================================================================
@@ -480,7 +493,7 @@ Dataset format (JSONL):
     print("This preserves the 4-bit quantization for memory efficiency.")
     print()
 
-    model, tokenizer = load_quantized_model(args.model_name, device="cuda")
+    model, tokenizer = load_quantized_model(args.model_name, device="cuda", cache_size=args.cache_size)
 
     # Verify quantization was preserved
     bnb_count = sum(1 for _, p in model.named_parameters() if isinstance(p, Params4bit))

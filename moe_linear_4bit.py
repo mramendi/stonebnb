@@ -21,74 +21,66 @@ import bitsandbytes.functional as bnb_F
 
 class MoELinear4Bit(torch.autograd.Function):
     """
-    Autograd function for 4-bit quantized MoE expert computation.
+    Autograd function for 4-bit quantized MoE expert computation with virtual weights.
 
-    Mimics MatMul4Bit behavior but handles 3D expert weights:
-    - Forward: Dequantizes once, processes all experts, saves quantized weights
-    - Backward: Dequantizes once for gradient computation
+    NEW: Uses WeightReference instead of saving full quantized tensor to ctx.
+    This enables:
+    - Lazy per-expert dequantization (only 1-2 experts at a time)
+    - LRU caching for reuse between forward and backward
+    - Lightweight ctx (50 bytes instead of 2GB)
 
-    Memory usage: Same as MatMul4Bit (dequant is temporary, not persistent)
+    Memory savings:
+    - Old: ~2GB quantized tensor in ctx + ~5GB full dequantization
+    - New: ~50 bytes WeightReference in ctx + ~140MB per expert (cached)
     """
 
     @staticmethod
-    def forward(ctx, inputs, weight_quantized, quant_state, expert_size, num_experts):
+    def forward(ctx, inputs, weight_ref, expert_size, num_experts):
         """
-        Forward pass for quantized MoE experts.
+        Forward pass with lazy per-expert dequantization.
 
         Args:
             inputs: Input tensor to route to experts
-            weight_quantized: Quantized 4-bit weight tensor (flattened format)
-            quant_state: QuantState with original shape [num_experts, out, in]
+            weight_ref: WeightReference (lightweight reference to weight source)
             expert_size: List of expert sizes for splitting inputs
             num_experts: Number of experts
 
         Returns:
             Concatenated output from all experts
         """
-        # Dequantize the 3D weight tensor ONCE
-        # Shape: [num_experts, out_features, in_features]
-        weight_full = bnb_F.dequantize_4bit(weight_quantized, quant_state)
-
         # Split inputs by expert assignment
         input_list = inputs.split(expert_size, dim=0)
 
-        # Process each expert with its slice of the dequantized weight
-        # CRITICAL: Use matmul directly instead of F.linear to prevent PyTorch
-        # from creating intermediate autograd nodes that save dequantized weights.
-        # F.linear(input, weight) is equivalent to: input @ weight.T
+        # Process each expert with lazy weight fetching
+        # Each get_expert() call uses the global LRU cache
         output_list = []
         for i in range(num_experts):
-            # Use the i-th expert's weights (2D slice)
-            # matmul doesn't create a separate autograd node - we control the backward
-            output_list.append(torch.matmul(input_list[i], weight_full[i].t()))
+            # Fetch only this expert's weights (cache hit if sequential)
+            expert_weight = weight_ref.get_expert(i)  # 2D BF16, uses global cache
+            output_list.append(torch.matmul(input_list[i], expert_weight.t()))
 
         # Concatenate outputs
         result = torch.cat(output_list, dim=0)
 
-        # Save for backward - CRITICAL: Save quantized weights, not dequantized!
-        # This is what makes it memory efficient
-        ctx.save_for_backward(inputs, weight_quantized)
-        ctx.quant_state = quant_state
+        # Save ONLY lightweight reference (not tensor!)
+        ctx.save_for_backward(inputs)
+        ctx.weight_ref = weight_ref  # ~50 bytes, not ~2GB!
         ctx.expert_size = expert_size
         ctx.num_experts = num_experts
         ctx.dtype = inputs.dtype
 
-        # weight_full is garbage collected here - not kept in memory!
         return result
 
     @staticmethod
     def backward(ctx, grad_output):
         """
-        Backward pass for quantized MoE experts.
+        Backward reuses cache from forward pass.
 
-        Dequantizes weights again for gradient computation.
-        Only computes grad_inputs (weights are frozen during training).
+        Since training processes experts sequentially, the experts loaded
+        during forward are likely still in the global LRU cache, giving
+        high cache hit rates.
         """
-        inputs, weight_quantized = ctx.saved_tensors
-
-        # Dequantize again for backward pass (temporary, just like forward)
-        # Shape: [num_experts, out_features, in_features]
-        weight_full = bnb_F.dequantize_4bit(weight_quantized, ctx.quant_state)
+        inputs = ctx.saved_tensors[0]
 
         # Split grad_output by expert
         grad_output_list = grad_output.split(ctx.expert_size, dim=0)
@@ -96,17 +88,17 @@ class MoELinear4Bit(torch.autograd.Function):
         # Compute gradient w.r.t. inputs for each expert
         grad_input_list = []
         for i in range(ctx.num_experts):
-            # grad_input = grad_output @ weight
+            # Fetch expert (likely cache hit from forward!)
+            expert_weight = ctx.weight_ref.get_expert(i)
             grad_input_list.append(
-                torch.matmul(grad_output_list[i], weight_full[i])
+                torch.matmul(grad_output_list[i], expert_weight)
             )
 
         grad_inputs = torch.cat(grad_input_list, dim=0)
 
         # We don't compute gradients for quantized weights (frozen during training)
-        # Return: grad_inputs, None for weight_quantized, None for quant_state,
-        #         None for expert_size, None for num_experts
-        return grad_inputs, None, None, None, None
+        # Return: grad_inputs, None for weight_ref, None for expert_size, None for num_experts
+        return grad_inputs, None, None, None
 
 
 class Dequantize4BitSlice(torch.autograd.Function):
@@ -211,11 +203,12 @@ def patch_params4bit_getitem():
 
 def patch_granite_moe_for_quantization():
     """
-    Monkey-patch GraniteMoeParallelExperts to use MoELinear4Bit when quantized.
+    Monkey-patch GraniteMoeParallelExperts to use MoELinear4Bit with virtual weights.
 
-    This modifies the forward() method to detect quantized weights and use
-    the memory-efficient MoELinear4Bit autograd function instead of the
-    naive loop that causes OOM.
+    This modifies the forward() method to:
+    1. Check if module has _weight_ref attribute (set during model loading)
+    2. Use MoELinear4Bit with WeightReference for memory-efficient computation
+    3. Fall back to original implementation for non-quantized weights
 
     Safe to call multiple times (idempotent).
     """
@@ -240,26 +233,22 @@ def patch_granite_moe_for_quantization():
 
     def quantized_forward(self, inputs, expert_size):
         """
-        Forward with quantization support.
+        Forward with virtual weight system support.
 
-        Detects if weights are quantized (Params4bit) and uses MoELinear4Bit
-        for memory-efficient computation. Falls back to original implementation
-        for non-quantized weights.
+        Uses WeightReference if available (set during model loading),
+        otherwise falls back to original implementation.
         """
-        from bitsandbytes.nn import Params4bit
-
-        # Check if weights are quantized
-        if isinstance(self.weight, Params4bit) and hasattr(self.weight, 'quant_state') and self.weight.quant_state is not None:
-            # Use memory-efficient quantized path
+        # Check if this module has a weight reference (virtual weight system)
+        if hasattr(self, '_weight_ref'):
+            # Use memory-efficient virtual weight path
             return MoELinear4Bit.apply(
                 inputs,
-                self.weight.data,           # Quantized weight tensor
-                self.weight.quant_state,    # QuantState with original shape
-                expert_size,                # Expert size info for splitting
-                self.num_experts            # Number of experts
+                self._weight_ref,    # WeightReference (lightweight, ~50 bytes)
+                expert_size,         # Expert size info for splitting
+                self.num_experts     # Number of experts
             )
         else:
-            # Fall back for non-quantized OR when quantized but accessed via __getitem__
+            # Fall back to original behavior (non-quantized or old code path)
             # CRITICAL: Dequantize ONCE before loop to avoid repeated full dequantization
             from bitsandbytes.nn import Params4bit
             import bitsandbytes.functional as bnb_F
@@ -285,7 +274,7 @@ def patch_granite_moe_for_quantization():
     # Apply the patch
     GraniteMoeParallelExperts.forward = quantized_forward
 
-    print("✓ Patched GraniteMoeParallelExperts for 4-bit quantization support")
+    print("✓ Patched GraniteMoeParallelExperts for virtual weight system")
     return True
 
 
